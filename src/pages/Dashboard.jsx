@@ -10,7 +10,9 @@ import {
   toggleStep,
   setSteps,
   checkDailyReset,
+  setLastUpdated,
 } from "../slices/routineSlice";
+import { clearUser } from "../slices/authSlice";
 import { Input } from "../components/ui/input";
 import { Button } from "../components/ui/button";
 import { Checkbox } from "../components/ui/checkbox";
@@ -20,6 +22,9 @@ import {
   saveDailyStep,
   fetchDailySteps,
   deleteDailyStep,
+  fetchLastUpdated,
+  saveLastUpdated,
+  saveHistory,
 } from "../utils/saveRoutines";
 
 export default function RoutineBuilder() {
@@ -28,58 +33,60 @@ export default function RoutineBuilder() {
   const [color, setColor] = useState("#FDE68A");
   const steps = useSelector((state) => state.routine.steps);
   const history = useSelector((state) => state.routine.history);
+  const lastUpdated = useSelector((state) => state.routine.lastUpdated);
+  const { uid } = useSelector((state) => state.auth);
   const dispatch = useDispatch();
-  const userId = auth.currentUser?.uid; // Get current user ID
 
-  // helper to get today's date string
   const todayStr = () => new Date().toISOString().split("T")[0];
 
-  // On mount: check for daily reset and load today's steps from Firestore (if logged in)
   useEffect(() => {
-    dispatch(checkDailyReset());
-
     const load = async () => {
-      if (!userId) return;
+      if (!uid) return;
       try {
-        const today = todayStr();
-        const fetched = await fetchDailySteps(userId, today);
+        const fetchedLastUpdated = await fetchLastUpdated(uid);
+        if (fetchedLastUpdated) {
+          dispatch(setLastUpdated(fetchedLastUpdated));
+        } else {
+          dispatch(setLastUpdated(todayStr()));
+          await saveLastUpdated(uid, todayStr());
+        }
+        dispatch(checkDailyReset());
+        const fetched = await fetchDailySteps(uid, todayStr());
         if (fetched && fetched.length > 0) {
-          // If Firestore has steps, populate the Redux store
           dispatch(setSteps(fetched));
         }
       } catch (err) {
-        console.error("Failed to load today's steps:", err);
+        console.error("Failed to load data:", err);
       }
     };
-
     load();
-  }, [userId, dispatch]);
+  }, [uid, dispatch]);
 
-  // Persist all changes to Firestore whenever steps change (debounced would be nicer, but simple approach)
   useEffect(() => {
-    // Only attempt save if user is logged in
-    if (!userId) return;
+    if (!uid) return;
     const today = todayStr();
-    // Save each step individually (create or update)
-    steps.forEach(async (s) => {
-      try {
-        await saveDailyStep(userId, today, s);
-      } catch (err) {
-        console.error("Failed to save step:", s.id, err);
+    if (lastUpdated !== today) {
+      const total = steps.length;
+      const completed = steps.filter((s) => s.completed).length;
+      if (lastUpdated && total > 0) {
+        saveHistory(uid, lastUpdated, completed, total);
       }
-    });
-  }, [steps, userId]);
+      saveLastUpdated(uid, today);
+      dispatch(checkDailyReset());
+      steps.forEach((step) =>
+        saveDailyStep(uid, today, { ...step, completed: false })
+      );
+    }
+  }, [steps, lastUpdated, uid]);
 
   const handleAdd = async (e) => {
     e.preventDefault();
     if (!title || !icon) return;
-    // dispatch addStep — dispatch returns the action with payload (the created step)
     const action = dispatch(addStep(title, icon, color));
-    const created = action.payload; // { id, title, icon, color, completed }
-    // save to Firestore under today's date
-    if (userId) {
+    const created = action.payload;
+    if (uid) {
       try {
-        await addRoutineToFirestore(userId, created, todayStr());
+        await addRoutineToFirestore(uid, created, todayStr());
       } catch (err) {
         console.error("Failed to add routine to Firestore:", err);
       }
@@ -91,14 +98,11 @@ export default function RoutineBuilder() {
 
   const handleToggle = async (id) => {
     dispatch(toggleStep(id));
-    if (!userId) return;
+    if (!uid) return;
     try {
-      // get latest step from local state (after the toggle)
-      const step = (steps.find((s) => s.id === id) || {});
-      // step may reflect prior state because dispatch is synchronous for reducers,
-      // but to be safe, flip completed before save if needed:
+      const step = steps.find((s) => s.id === id) || {};
       const updatedStep = { ...step, completed: !step.completed };
-      await saveDailyStep(userId, todayStr(), updatedStep);
+      await saveDailyStep(uid, todayStr(), updatedStep);
     } catch (err) {
       console.error("Failed to save toggle to Firestore:", err);
     }
@@ -106,11 +110,20 @@ export default function RoutineBuilder() {
 
   const handleRemove = async (id) => {
     dispatch(removeStep(id));
-    if (!userId) return;
+    if (!uid) return;
     try {
-      await deleteDailyStep(userId, todayStr(), id);
+      await deleteDailyStep(uid, todayStr(), id);
     } catch (err) {
       console.error("Failed to delete step in Firestore:", err);
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await signOut(auth);
+      dispatch(clearUser());
+    } catch (err) {
+      console.error("Logout failed:", err);
     }
   };
 
@@ -120,7 +133,15 @@ export default function RoutineBuilder() {
 
   return (
     <div className="max-w-4xl mx-auto mt-10 p-8 bg-white rounded-lg shadow-lg">
-      <h2 className="text-2xl font-bold mb-6 text-center">Build Your Routine</h2>
+      <div className="flex justify-between items-center mb-6">
+        <h2 className="text-2xl font-bold">Build Your Routine</h2>
+        <Button
+          onClick={handleLogout}
+          className="px-4 py-2 bg-red-500 text-white rounded hover:bg-red-600"
+        >
+          Logout
+        </Button>
+      </div>
 
       <form onSubmit={handleAdd} className="flex flex-wrap gap-6 mb-8 justify-center">
         <Input
@@ -187,13 +208,12 @@ export default function RoutineBuilder() {
           ))}
         </ul>
 
-        {/* Small history view (last 5 days) */}
         {history && history.length > 0 && (
           <div className="mt-6">
-            <h3 className="text-lg font-medium mb-2">Recent progress</h3>
+            <h3 className="text-lg font-medium mb-2">Recent Progress</h3>
             <ul className="space-y-1 text-sm text-gray-700">
-              {history.slice(-5).reverse().map((h) => (
-                <li key={h.date}>
+              {history.slice(-5).reverse().map((h, index) => (
+                <li key={`${h.date}-${index}`}>
                   <strong>{h.date}</strong>: {h.completed}/{h.total} done
                 </li>
               ))}
